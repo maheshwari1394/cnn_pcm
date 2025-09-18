@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Fraud Call Detection with CNN</title>
+    <style>
+        /* (same styling as you provided) */
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #dff1ff, #e0f7fa, #fdfbfb);
+            background-size: 200% 200%;
+            animation: gradientShift 10s ease infinite;
+            padding: 40px 20px;
+            min-height: 100vh;
+            text-align: center;
+            color: #333;
+        }
+        h1 { color: #007bff; margin-bottom: 30px; font-size: 2.4rem; text-shadow: 1px 1px 2px rgba(0,0,0,0.05); }
+        #controls { display:flex; flex-wrap:wrap; justify-content:center; gap:12px; margin-top:20px; }
+        #controls button { padding:14px 28px; font-size:1.1rem; border:none; border-radius:10px; cursor:pointer; font-weight:600; transition: background-color .3s, transform .2s; box-shadow:0 6px 10px rgba(0,0,0,0.08); }
+        #controls button:enabled { background: linear-gradient(to right,#007bff,#00c6ff); color:white; }
+        #controls button:enabled:hover { transform: translateY(-2px); }
+        #controls button:disabled { background:#ccc; color:#666; cursor:not-allowed; }
+        #status,#prediction,#transcript,#sentence-prediction { margin-top:25px; padding:14px 22px; border-radius:12px; background:#fff; box-shadow:0 4px 12px rgba(0,0,0,0.05); width:fit-content; margin-left:auto; margin-right:auto; font-size:1.1rem; font-weight:500; animation:fadeInUp .5s; }
+        #status { border-left:5px solid #007bff; color:#444; }
+        #sentence-prediction { border-left:5px solid #ffa500; color:#d87b00; background:#fff5e6; }
+        #prediction { border-left:5px solid #28a745; color:#28a745; background:#e6ffe6; }
+        #transcript { border-left:5px solid #ffa500; color:#d87b00; background:#fff5e6; }
+        @keyframes fadeInUp { from { opacity:0; transform:translateY(20px);} to { opacity:1; transform:translateY(0);} }
+        @keyframes gradientShift { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+        @media (max-width:600px) {
+            h1 { font-size:1.8rem; }
+            #controls { flex-direction:column; }
+            #controls button { width:100%; }
+            #status,#prediction,#transcript,#sentence-prediction { font-size:1rem; padding:12px 18px; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Fraud Call Detection using CNN</h1>
+
+    <div id="controls">
+        <button id="startButton">Start Microphone</button>
+        <button id="stopButton" disabled>Stop Microphone</button>
+    </div>
+
+    <div id="status">Status: Initializing...</div>
+    <div id="sentence-prediction">Sentence Prediction: (Waiting for audio)</div>
+    <div id="prediction">Conversation Prediction: (Waiting for conversation end)</div>
+    <div id="transcript">Transcript: (Waiting for speech)</div>
+
+    <script>
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    let audioProcessorNode;
+    let mediaStreamSource;
+    let currentStream;
+    let isRecording = false;
+    let sessionId = null;
+    let audioChunkQueue = [];
+    let processingChunk = false;
+    let isFinalizing = false;
+
+    const WINDOW_DURATION_SECONDS = 5.0; 
+    const HOP_DURATION_SECONDS = 2.5;
+
+    const SERVER_URL = 'http://127.0.0.1:4567';
+
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const statusDiv = document.getElementById('status');
+    const sentencePredictionDiv = document.getElementById('sentence-prediction');
+    const predictionDiv = document.getElementById('prediction');
+    const transcriptDiv = document.getElementById('transcript');
+
+    // fetch with retry (same as before)
+    async function fetchWithRetry(url, options = {}, retries = 3) {
+        for (let i = 0; i < retries; i++) {
+            try {
+                const resp = await fetch(url, options);
+                if (resp.ok || resp.status === 410) return resp;
+                if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) return resp;
+            } catch (err) {
+                if (i === retries - 1) throw err;
+                await new Promise(r => setTimeout(r, Math.pow(2, i) * 500));
+            }
+        }
+        throw new Error('fetch failed after retries');
+    }
+
+    // Speech recognition (optional)
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition;
+    if (SpeechRecognition) {
+        recognition = new SpeechRecognition();
+        recognition.lang = 'en-US';
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onresult = (event) => {
+            let transcript = '';
+            for (let i = event.resultIndex; i < event.results.length; i++) {
+                transcript += event.results[i][0].transcript;
+            }
+            transcriptDiv.textContent = 'Transcript: ' + transcript;
+        };
+        recognition.onerror = (e) => console.error('Speech recognition error', e);
+    } else {
+        transcriptDiv.textContent = 'Transcript: Speech recognition not supported.';
+    }
+
+    document.addEventListener('DOMContentLoaded', async () => {
+        statusDiv.textContent = 'Status: Loading audio processor module...';
+        try {
+            await audioContext.audioWorklet.addModule('audio_processor.js');
+            statusDiv.textContent = 'Status: Audio processor loaded and ready.';
+            startButton.addEventListener('click', startAudio);
+            stopButton.addEventListener('click', stopAudio);
+        } catch (e) {
+            console.error('Failed to load audio worklet:', e);
+            statusDiv.textContent = 'Error loading audio processor. Serve files via HTTP server.';
+            startButton.disabled = true;
+        }
+    });
+
+    async function startAudio() {
+        if (audioContext.state === 'suspended') await audioContext.resume();
+
+        statusDiv.textContent = 'Status: Starting new conversation (asking server for session)...';
+
+        try {
+            const resp = await fetchWithRetry(`${SERVER_URL}/start_conversation`, { method: 'POST' });
+            if (!resp.ok) throw new Error(`start_conversation failed: ${resp.status}`);
+            const data = await resp.json();
+            sessionId = data.session_id;
+            statusDiv.textContent = `Status: Conversation started. Session ID: ${sessionId}`;
+
+            currentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaStreamSource = audioContext.createMediaStreamSource(currentStream);
+
+            audioProcessorNode = new AudioWorkletNode(audioContext, 'audio_processor');
+            mediaStreamSource.connect(audioProcessorNode);
+            audioProcessorNode.connect(audioContext.destination);
+
+            // configure processor
+            audioProcessorNode.port.postMessage({
+                type: 'START_SLIDING_WINDOW',
+                windowSize: WINDOW_DURATION_SECONDS,
+                hopSize: HOP_DURATION_SECONDS
+            });
+
+            audioProcessorNode.port.onmessage = (event) => {
+                if (event.data.type === 'AUDIO_CHUNK') {
+                    audioChunkQueue.push(event.data.data); // ArrayBuffer
+                    if (!processingChunk) processNextChunk();
+                }
+            };
+
+            isRecording = true;
+            isFinalizing = false;
+            startButton.disabled = true;
+            stopButton.disabled = false;
+            sentencePredictionDiv.textContent = 'Sentence Prediction: Listening...';
+            predictionDiv.textContent = 'Conversation Prediction: (in progress...)';
+            statusDiv.textContent = 'Status: Microphone active. Recording...';
+
+            if (recognition) {
+                transcriptDiv.textContent = 'Transcript: ';
+                recognition.start();
+            }
+        } catch (err) {
+            console.error('startAudio error', err);
+            statusDiv.textContent = `Error starting audio: ${err.message}`;
+            startButton.disabled = false;
+            stopButton.disabled = true;
+        }
+    }
+
+    // Process queue sequentially
+    async function processNextChunk() {
+        if (audioChunkQueue.length === 0) {
+            processingChunk = false;
+            if (isFinalizing) {
+                statusDiv.textContent = 'Status: Waiting for server to produce final result...';
+            }
+            return;
+        }
+
+        processingChunk = true;
+        const audioChunkData = audioChunkQueue.shift();
+        const audioChunk = new Float32Array(audioChunkData);
+
+        // raw PCM blob (no WAV header)
+        const pcmBlob = new Blob([audioChunk.buffer], { type: 'application/octet-stream' });
+
+        const formData = new FormData();
+        formData.append('audio', pcmBlob, 'chunk.pcm');
+        formData.append('session_id', sessionId || '');
+        formData.append('samplerate', audioContext.sampleRate); // send sample rate to server
+
+        const willBeLast = isFinalizing && audioChunkQueue.length === 0;
+
+        const fetchOptions = {
+            method: 'POST',
+            body: formData,
+            headers: willBeLast ? { 'X-Is-Last-Chunk': 'true' } : {}
+        };
+
+        try {
+            const resp = await fetchWithRetry(`${SERVER_URL}/process_audio`, fetchOptions);
+            if (!resp.ok) {
+                console.error('Server returned error', resp.status);
+                statusDiv.textContent = `Status: Server error ${resp.status}`;
+            } else {
+                const j = await resp.json();
+                if (j.is_final) {
+                    predictionDiv.textContent = `Conversation Prediction: ${j.final_prediction} (Avg Confidence ${(j.average_confidence * 100).toFixed(2)}%)`;
+                    statusDiv.textContent = 'Status: Final prediction received.';
+                    sessionId = null;
+                    if (j.final_prediction === "Normal") {
+                        predictionDiv.style.borderColor = '#28a745';
+                        predictionDiv.style.backgroundColor = '#e6ffe6';
+                        predictionDiv.style.color = '#28a745';
+                    } else {
+                        predictionDiv.style.borderColor = '#dc3545';
+                        predictionDiv.style.backgroundColor = '#f8d7da';
+                        predictionDiv.style.color = '#dc3545';
+                    }
+                } else {
+                    sentencePredictionDiv.textContent = `Sentence Prediction: chunk received (${new Date().toLocaleTimeString()})`;
+                }
+            }
+        } catch (err) {
+            console.error('Network error', err);
+            statusDiv.textContent = 'Status: Network error while sending chunk.';
+        } finally {
+            if (sessionId) {
+                setTimeout(processNextChunk, 0);
+            } else {
+                processingChunk = false;
+            }
+        }
+    }
+
+    async function stopAudio() {
+        if (!isRecording) return;
+        isRecording = false;
+        isFinalizing = true;
+
+        if (audioProcessorNode) {
+            audioProcessorNode.port.postMessage({ type: 'STOP_RECORDING' });
+        }
+        if (currentStream) currentStream.getTracks().forEach(t => t.stop());
+        if (mediaStreamSource) mediaStreamSource.disconnect();
+        if (audioProcessorNode) audioProcessorNode.disconnect();
+        if (recognition) recognition.stop();
+
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        statusDiv.textContent = 'Status: Microphone stopped. Finalizing...';
+
+        if (!processingChunk) processNextChunk();
+    }
+</script>
+
+</body>
+</html>
