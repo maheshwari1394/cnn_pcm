@@ -64,5 +64,3 @@ laptop-laptop-cnn-github/
 ├── client_serve_appmod.py  # Flask server for serving static client files
 ├── requirements_mod.txt    # Python dependencies
 └── README.md               # This file
-
-
