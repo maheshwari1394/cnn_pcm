@@ -82,6 +82,3 @@ The system uses a confidence threshold of **0.60**:
 - Confidence < 0.60 → **Fraud**
 - Confidence ≥ 0.60 → **Normal**
 
----
-  "session_id": "uuid-string"
-}
